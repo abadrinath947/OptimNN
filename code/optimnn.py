@@ -13,12 +13,12 @@ import torch.optim as optim
 from preprocess import *
 from pyBKT.models import Model
 
-data = pd.read_csv('data/as.csv', encoding = 'latin')
-tag = 'assist' if 'template_id' in data.columns else 'cogtutor'
+data = pd.read_csv(sys.argv[3], encoding = 'latin')
+tag = sys.argv[3].replace('/', '_')
 num_epochs = 12 if 'template_id' in data.columns else 5
 batch_size = 64 if 'template_id' in data.columns else 2048
 train_split = 0.8
-hidden_dim, num_layers = 128, 4
+hidden_dim, num_layers = int(sys.argv[1]), int(sys.argv[2])
 assert hidden_dim >= 16
 assert 1 <= num_layers <= 32
 
@@ -36,7 +36,8 @@ class BKTNN(nn.Module):
 
     def forward(self, X, y):
         B, T = y.shape
-
+        if X.max() >= self.num_skills or X.min() < 0 or torch.isnan(X).any():
+            import pdb; pdb.set_trace()
         params = torch.clamp(self.nn_params(self.skill_embed(X)), 1e-6, 1 - 1e-6)
         latent = params[..., -1]
         corrects, latents = torch.zeros((B, T)).cuda(), torch.zeros((B, T)).cuda()
@@ -57,15 +58,15 @@ class BKTNN(nn.Module):
 
 def preprocess_data(data):
     features = ['correct', 'skill_id']
-    seqs = data.groupby(['user_id', 'skill_name'])[features].apply(lambda x: x.values.tolist())
+    seqs = data.groupby(['user_id', 'skill_id'])[features].apply(lambda x: x.values.tolist())
     length = max(seqs.str.len()) + 1
     seqs = seqs.apply(lambda s: s + (length - min(len(s), length)) * [[-1] * len(features)])
     return seqs
 
 def construct_batches(raw_data, epoch = 0, val = False):
     np.random.seed(epoch)
-    groups = raw_data.groupby(['user_id', 'skill_name']).size()
-    data = raw_data.set_index(['user_id', 'skill_name'])
+    groups = raw_data.groupby(['user_id', 'skill_id']).size()
+    data = raw_data.set_index(['user_id', 'skill_id'])
     idx = 0
     while len(groups.iloc[idx * batch_size: (idx + 1) * batch_size].index) > 0 and idx < 600:
         if val:
@@ -75,9 +76,39 @@ def construct_batches(raw_data, epoch = 0, val = False):
         batch_preprocessed = preprocess_data(filtered_data)
         batch = np.array(batch_preprocessed.to_list())
         if batch.dtype == np.str_:
-            import pdb; pdb.set_trace()
+            raise ValueError("found invalid type")
         X = torch.tensor(batch[:, 0, 1], dtype=torch.int).cuda()
         y = torch.tensor(batch[:, ..., 0], dtype=torch.float32).cuda()
+        yield X, y
+        idx += 1
+
+def construct_batches(raw_data, epoch = 0, val = False):
+    np.random.seed(epoch)
+    #groups = raw_data.groupby(['user_id', 'skill_id']).size()
+    #data = raw_data.set_index(['user_id', 'skill_id'])
+    idx = 0
+    import polars as pl
+    df2 = pl.from_pandas(raw_data)
+    grouped = df2[["user_id", "skill_id", "correct"]].groupby(["user_id", "skill_id"]).agg([pl.col("correct").explode()])
+    if not val:
+        grouped = grouped.sample(len(grouped))
+        lens = np.log(grouped['correct'].list.lengths().to_numpy() + 1)
+
+    while len(grouped[idx * batch_size: (idx + 1) * batch_size]) > 0:
+        if not val:
+            sample_idx = np.random.choice(range(len(grouped)), size=batch_size, p = lens/lens.sum(), replace=False)
+            filtered_data = grouped[sample_idx, 1:].rows()
+        else:
+            filtered_data = grouped[idx * batch_size: (idx + 1) * batch_size, 1:].rows()
+        batch = [(j, [i] * len(j)) for i, j in filtered_data]
+        from text2array import Batch
+        batch = np.transpose(Batch([{'x': batch}]).to_array(pad_with=-1)['x'], (0, 1, 3, 2))[0]
+
+        batch = torch.from_numpy(batch).cuda()
+        # batch_preprocessed = preprocess_data(filtered_data)
+        # batch = np.array(batch_preprocessed.to_list())
+        X = batch[:, 0, 1]
+        y = batch[:, ..., 0].to(torch.float32)
         yield X, y
         idx += 1
 
@@ -93,8 +124,8 @@ def evaluate(model, batches):
     return ypred, ytrue #roc_auc_score(ytrue, ypred)
 
 
-def train(model, batches_train, batches_val, num_epochs):
-    optimizer = optim.Adam(model.parameters(), lr = float(sys.argv[3]))
+def train(model, batches_train, batches_test, num_epochs):
+    optimizer = optim.Adam(model.parameters(), lr = 5e-4)
     for epoch in range(num_epochs):
         model.train()
         batches_train = construct_batches(data_train)
@@ -112,24 +143,23 @@ def train(model, batches_train, batches_val, num_epochs):
             losses.append(loss.item())
             pbar.set_description(f"Training Loss: {np.mean(losses)}")
 
-        if  epoch % 1 == 0:
-            batches_val = construct_batches(data_val, val = True)
-            ypred, ytrue = evaluate(model, batches_val)
+        if  epoch == num_epochs - 1:
+            batches_test = construct_batches(data_test, val = True)
+            ypred, ytrue = evaluate(model, batches_test)
             model.eval()
             auc = roc_auc_score(ytrue, ypred)
             acc = (ytrue == ypred.round()).mean()
             rmse = np.sqrt(np.mean((ytrue - ypred) ** 2))
-            print(f"Epoch {epoch}/{num_epochs} - [VALIDATION AUC: {auc}] - [VALIDATION ACC: {acc}] - [VALIDATION RMSE: {rmse}]")
-            torch.save(model.state_dict(), f"ckpts/model-{tag}-{hidden_dim}-{num_layers}-{epoch}-{auc}-{acc}-{rmse}.pth")
+            print(f"Epoch {epoch}/{num_epochs} - [TEST AUC: {auc}] - [TEST ACC: {acc}] - [TEST RMSE: {rmse}]")
+            torch.save(model.state_dict(), f"ckpts_optimnn/model-{tag}-{hidden_dim}-{num_layers}-{epoch}-{auc}-{acc}-{rmse}.pth")
 
 def train_test_split(data, skill_list = None):
-    np.random.seed(42)
-    data = data.set_index(['user_id', 'skill_name'])
+    data = data.set_index(['user_id', 'skill_id'])
     idx = np.random.permutation(data.index.unique())
     train_idx, test_idx = idx[:int(train_split * len(idx))], idx[int(train_split * len(idx)):]
     data_train = data.loc[train_idx].reset_index()
-    data_val = data.loc[test_idx].reset_index()
-    return data_train, data_val
+    data_test = data.loc[test_idx].reset_index()
+    return data_train, data_test
 
 def bkt_benchmark(train_data, test_data, **model_type):
     model = Model()
@@ -152,40 +182,24 @@ def test_rules(model):
     skills = torch.Tensor(list(range(num_skills)))
     skills = skills.long().cuda()
     params = model.nn_params(model.skill_embed(skills))
-    print(params[:, 1])
     return (params[:, 2] > 0.5).sum() / num_skills, (params[:, 1] > 0.5).sum() / num_skills, (params[:, 0] > (1 - params[:, 2])/ params[:, 1]).sum() / num_skills
 
 if __name__ == '__main__': 
-    """
-    Equation Solving Two or Fewer Steps              24253
-    Percent Of                                       22931
-    Addition and Subtraction Integers                22895
-    Conversion of Fraction Decimals Percents         20992
-    """
-    data_train, data_val = preprocess(data, impute_template = False)
-    print("BKT:", bkt_benchmark(data_train, data_val))
+    data_train, data_val, data_test = preprocess(data, impute_template = False)
+    #print("BKT:", bkt_benchmark(data_train, data_test))
 
     print("Train-test split complete...")
 
     test_extract()
 
     batches_train = construct_batches(data_train)
-    batches_val = construct_batches(data_val)
-    model = BKTNN(len(data_train['skill_name'].unique()), hidden_dim, num_layers).cuda()
+    batches_test = construct_batches(data_test)
+    model = BKTNN(max(data_train['skill_id'].max(), data_test['skill_id'].max()) + 1, hidden_dim, num_layers).cuda()
     # model.load_state_dict(torch.load('ckpts/model-cogtutor-128-4-2-0.7515170857913365-0.8599057896697341-0.3297936022281647.pth'))
     # model.load_state_dict(torch.load('ckpts/model-128-4-11-0.8198373552322507-0.7780222719315308-0.3903290629386902.pth'))
     # import pdb; pdb.set_trace()
     # test_rules(model)
     print("Total Parameters:", sum(p.numel() for p in model.parameters()))
 
-    """
-    val = list(batches_val)
-    for i, (X, y) in enumerate(val):
-        if y.shape[0] > 5:
-            corrects, latents, params, loss = model(X, y, True)
-            for j in range(y.shape[1]):
-                if y[:, j, :].mean() < latents[:, j, :].max() and latents[:, j, :].max() >= 0.75 and torch.unique_consecutive(y[:, j]).numel() >= 0.5 * y[:, j].numel():
-                    print(i, j, y[:, j], latents[:, j])
-    """
     print("Beginning training...")
-    train(model, data_train, data_val, num_epochs)
+    train(model, data_train, data_test, num_epochs)

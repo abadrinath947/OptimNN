@@ -14,15 +14,15 @@ from torch import nn
 import torch.optim as optim
 from pyBKT.models import Model
 
-data = pd.read_csv('data/processed_algebra.csv', encoding = 'latin')
+data = pd.read_csv(sys.argv[1], encoding = 'latin')
 cogtutor = 'template_id' not in data.columns
-num_epochs = 6 if 'template_id' in data.columns else 2
-train_batch_size = 64 if 'template_id' in data.columns else 512
+num_epochs = 6 if not cogtutor else 2
+train_batch_size = 64 if not cogtutor else 256
 val_batch_size = 32
 train_split = 0.8
 
 hidden_dim = 128
-variant = 'KT-IDEM'
+variant = sys.argv[2]
 
 class BKTNN(nn.Module):
 
@@ -47,9 +47,8 @@ class BKTNN(nn.Module):
                                       nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
                                       nn.Linear(hidden_dim, 1), nn.Sigmoid()
                 ).cuda()
-                                    
         self.skill_embed = nn.Embedding(num_skills, 32 if cogtutor else hidden_dim)
-        self.multiplex_embed = nn.Embedding(num_multi, 32 if cogtutor else hidden_dim)
+        self.multiplex_embed = nn.Embedding(num_multi, 16 if cogtutor else hidden_dim)
         self.num_skills = num_skills
         self.variant = variant
 
@@ -59,7 +58,11 @@ class BKTNN(nn.Module):
         
         skill_emb = self.skill_embed(X[..., 0])
         skill_params = self.nn_skill_params(skill_emb)
-        multiplex_params = self.nn_multiplex_params(skill_emb + self.multiplex_embed(X[..., 1]))
+        if cogtutor:
+            mplex_raw = self.multiplex_embed(X[..., 1])
+            multiplex_params = self.nn_multiplex_params(torch.cat([skill_emb[..., :16] + mplex_raw, skill_emb[..., 16:]], dim = -1)) 
+        else:
+            multiplex_params = self.nn_multiplex_params(skill_emb + self.multiplex_embed(X[..., 1]))
         params = torch.zeros_like(skill_params).cuda()
         if self.variant == 'KT-IDEM':
             params[..., 0] = skill_params[..., 0]
@@ -88,15 +91,15 @@ class BKTNN(nn.Module):
 
 def preprocess_data(data):
     features = ['correct', 'skill_id', multi_col]
-    seqs = data.groupby(['user_id', 'skill_name'])[features].apply(lambda x: x.values.tolist())
+    seqs = data.groupby(['user_id', 'skill_id'])[features].apply(lambda x: x.values.tolist())
     length = max(seqs.str.len()) + 1
     seqs = seqs.apply(lambda s: s + (length - min(len(s), length)) * [[-1] * len(features)])
     return seqs
 
 def construct_batches(raw_data, epoch = 0, val = False):
     np.random.seed(epoch)
-    groups = raw_data.groupby(['user_id', 'skill_name']).size()
-    data = raw_data.set_index(['user_id', 'skill_name'])
+    groups = raw_data.groupby(['user_id', 'skill_id']).size()
+    data = raw_data.set_index(['user_id', 'skill_id'])
     idx = 0
     if val:
         batch_size = val_batch_size
@@ -126,7 +129,7 @@ def evaluate(model, batches):
     return ypred, ytrue #roc_auc_score(ytrue, ypred)
 
 
-def train(model, batches_train, batches_val, num_epochs):
+def train(model, batches_train, batches_test, num_epochs):
     optimizer = optim.Adam(model.parameters(), lr = 1e-3)
     for epoch in range(num_epochs):
         model.train()
@@ -145,24 +148,24 @@ def train(model, batches_train, batches_val, num_epochs):
             losses.append(loss.item())
             pbar.set_description(f"Training Loss: {np.mean(losses)}")
 
-        if  epoch % 1 == 0:
-            batches_val = construct_batches(data_val, val = True)
-            ypred, ytrue = evaluate(model, batches_val)
+        if  epoch == num_epochs - 1:
+            batches_test = construct_batches(data_test, val = True)
+            ypred, ytrue = evaluate(model, batches_test)
             model.eval()
             auc = roc_auc_score(ytrue, ypred)
             acc = (ytrue == ypred.round()).mean()
             rmse = np.sqrt(np.mean((ytrue - ypred) ** 2))
-            print(f"Epoch {epoch}/{num_epochs} - [VALIDATION AUC: {auc}] - [VALIDATION ACC: {acc}] - [VALIDATION RMSE: {rmse}]")
-            torch.save(model.state_dict(), f"ckpts/model-variant-{tag}-{epoch}-{auc}-{acc}-{rmse}.pth")
+            print(f"Epoch {epoch}/{num_epochs} - [TEST AUC: {auc}] - [TEST ACC: {acc}] - [TEST RMSE: {rmse}]")
+            torch.save(model.state_dict(), f"ckpts_optimnn/model-variant-{variant}-{epoch}-{auc}-{acc}-{rmse}.pth")
 
 def train_test_split(data, skill_list = None):
     np.random.seed(42)
-    data = data.set_index(['user_id', 'skill_name'])
+    data = data.set_index(['user_id', 'skill_id'])
     idx = np.random.permutation(data.index.unique())
     train_idx, test_idx = idx[:int(train_split * len(idx))], idx[int(train_split * len(idx)):]
     data_train = data.loc[train_idx].reset_index()
-    data_val = data.loc[test_idx].reset_index()
-    return data_train, data_val
+    data_test = data.loc[test_idx].reset_index()
+    return data_train, data_test
 
 def bkt_benchmark(train_data, test_data, **model_type):
     model = Model()
@@ -173,24 +176,17 @@ def bkt_benchmark(train_data, test_data, **model_type):
     return model.evaluate(data = test_data, metric = ['auc', 'accuracy', 'rmse'])
 
 if __name__ == '__main__': 
-    """
-    Equation Solving Two or Fewer Steps              24253
-    Percent Of                                       22931
-    Addition and Subtraction Integers                22895
-    Conversion of Fraction Decimals Percents         20992
-    """
-    print("tag:", tag, "hidden:", int(sys.argv[2]), "variant:", sys.argv[3])
-    data_train, data_val = preprocess(data, True)
+    data_train, data_val, data_test = preprocess(data, True)
     multi_col = 'template_id' if 'template_id' in data.columns else 'Problem Name'
 
-    #print("BKT:", bkt_benchmark(data_train, data_val))
-    #print("KT-IDEM:", bkt_benchmark(data_train, data_val, multigs = True))
-    #print("ILE:", bkt_benchmark(data_train, data_val, multilearn = True))
+    #print("BKT:", bkt_benchmark(data_train, data_test))
+    #print("KT-IDEM:", bkt_benchmark(data_train, data_test, multigs = True))
+    #print("ILE:", bkt_benchmark(data_train, data_test, multilearn = True))
 
     print("Train-test split complete...")
 
-    model = BKTNN(len(data_train['skill_name'].unique()), len(data_train[multi_col].unique()), hidden_dim, variant).cuda()
+    model = BKTNN(data_train['skill_id'].max() + 1, data_train[multi_col].max()+1, hidden_dim, variant).cuda()
     print("Total Parameters:", sum(p.numel() for p in model.parameters()))
 
     print("Beginning training...")
-    train(model, data_train, data_val, num_epochs)
+    train(model, data_train, data_test, num_epochs)
